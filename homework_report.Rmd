@@ -1,0 +1,323 @@
+---
+title: "Milestone Report for Word Predictions Project"
+author: "Chengxu Bian"
+date: "November 25, 2016"
+output:
+  html_document:
+    theme: yeti
+    highlight: zenburn
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    number_sections: false
+    code_folding: show
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE, include=TRUE, warning=FALSE, message=FALSE, error=FALSE, cache=FALSE)
+library(tm)
+library(ggplot2)
+library(SnowballC)
+library(wordcloud)
+library(parallel)
+library(RWeka)
+library(dplyr)
+library(tidytext)
+library(qdap)
+library(knitr)
+library(stringi)
+library(xtable)
+options(mc.cores=1) ##Package "parallel"
+setwd("~/Desktop/homework_R/")
+```
+## 1. Introduction
+The goal of this project is to predict the word you would type out, based on the preceding word or words you have alreay written, especially on mobile devices. This project will serve as an effective training process for being a data scientist, by using text data mining as a model.
+
+As required, we will using the corpus (a collection of text data) download from [HC Corpora](http://www.corpora.heliohost.org/). More specificially, we will use some text in English, which were pulled out from news, blogs, and twitter updates. 
+[https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip).
+
+The plan is straightforward: we will have to explore, and clean up the data; then set up prediction models based on the relationship and the frequencies of words or word combinations in the corpus.
+
+## 2. Exploratory Analysis {.tabset .tabset-shake .tabset-pills}
+
+[//]: # (### Step 0: Download the Corpus)
+```{r download, echo=FALSE}
+# corpus_url <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+
+# temp <- tempfile()
+# download.file(corpus_url,"Coursera-SwiftKey.zip")
+# unzip("Coursera-SwiftKey.zip")
+# unlink(temp)
+```
+
+### 2.1 Load data
+The three sources of corpus are read into three hugh charactor vectors.
+```{r load_data, cache=TRUE}
+twitts_corpus <- readLines("en_US.twitter.txt", encoding="UTF-8", skipNul=TRUE)
+news_corpus <- readLines("en_US.news.txt", encoding="UTF-8", skipNul=TRUE)
+blogs_corpus <- readLines("en_US.blogs.txt", encoding="UTF-8", skipNul=TRUE)
+```
+
+### 2.2 Rough summary of the corpus 
+We can see that all these three source of texts are pretty large: Twitter `r format(object.size(twitts_corpus),"MB")`
+News: `r format(object.size(news_corpus),"MB")`
+Blogs: `r format(object.size(blogs_corpus),"MB")`.
+From Table 1, we will realize that the sizes of the corpus are too large, and it is unrealistic to use the whole corpus as a training set for the future word prediction model.
+
+One of the simple strategies is randomly choosing a subset lines of the corpus, the sizes of which are more managable and efficient. We will do in the next section.
+
+```{r rough_summary, cache=TRUE}
+source_names <- c("From Twitter", "From News", "From Blogs")
+
+source_sizes <- c(format(object.size(twitts_corpus),"MB"),
+  format(object.size(news_corpus),"MB"),
+  format(object.size(blogs_corpus),"MB"))
+
+source_lines <- c(length(twitts_corpus), length(news_corpus), length(blogs_corpus))
+
+max_number_of_words <- 
+c(max(stri_count_words(twitts_corpus)), max(stri_count_words(news_corpus)),max(stri_count_words(blogs_corpus)))
+
+total_words <- c(stri_stats_latex(twitts_corpus)["Words"], stri_stats_latex(news_corpus)["Words"],         stri_stats_latex(blogs_corpus)["Words"])
+
+overview <- data.frame(
+            row.names = source_names, 
+            Size = source_sizes,
+            Maximum_Words_per_Line = max_number_of_words,
+            Number_of_Lines = source_lines,
+            Total_Words = total_words
+            )
+
+kable(overview, caption="Table 1: Rough Overview of the Corpus", align="c")
+
+```
+
+
+## 3. Sampling the Corpus {.tabset .tabset-fade .tabset-pills}
+
+###Step1: Collect random samples
+Due to the hugh size of the original corpus, here we are using just 0.5% lines of the corpus, which are just randomly selected.
+
+```{r random_sample, eval=FALSE, cache=TRUE}
+portion <- 0.005
+set.seed(2016)
+twitts_subset <- sample(twitts_corpus, portion*length(twitts_corpus), replace=FALSE)
+
+news_subset <- sample(news_corpus, portion*length(news_corpus), replace=FALSE)
+
+blogs_subset <- sample(blogs_corpus, portion*length(blogs_corpus), replace=FALSE)
+```
+
+###Step2: Split lines to sentences
+We will use "sent_detect_nlp" function from "qdap" packages to split each single line to one or several sentences, and then generate a new vector, each entry of which is one single sentence.
+
+```{r split_sentences, eval=FALSE, cache=TRUE}
+line_to_sentences <- function(old_vector) {
+  new_vector <- vector(mode="character")
+  ## read through lines
+  for (single_line in 1:length(old_vector)) {
+    add_on_elements <- sent_detect_nlp(old_vector[single_line])
+    new_vector <- c(new_vector, add_on_elements)
+  }
+  return(new_vector)
+}
+
+twitts_sentences <- line_to_sentences(twitts_subset)
+news_sentences <- line_to_sentences(news_subset)
+blogs_sentences <- line_to_sentences(blogs_subset)
+
+writeLines(twitts_sentences, con="./subsets/twitts_training_sample.txt")
+writeLines(news_sentences, con="./subsets/news_training_sample.txt")
+writeLines(blogs_sentences, con="./subsets/blogs_training_sample.txt")
+```
+
+
+## 4. Preprocessing the Corpus {.tabset .tabset-fade .tabset-pills}
+
+### Step1: Load the samples
+
+Now, we are using text mining tools from "tm" package. First, we have to set a directory containing the samples files; then, "Corpus" function is used to conver the text files to corpus object.
+```{r loading, cache=TRUE}
+where_is_the_corpus <- file.path("~", "Desktop", "homework_R", "subsets")
+where_is_the_corpus
+dir(where_is_the_corpus)   # Check the files. 
+texts <- Corpus(DirSource(where_is_the_corpus))
+```
+
+### Step2: Cleaning up
+We will use the tools in package "tm" to clean up and analysis the corpus. We will remove punctuations, numbers, and some so called "stop words", which are common and at the same time do not carry significant information, such as "and", "a", etc. At the same time, we will also covert the words to lower case.
+
+```{r preprocessing}
+texts <- tm_map(texts, removePunctuation)
+texts <- tm_map(texts, removeNumbers)
+texts <- tm_map(texts, tolower)
+texts <- tm_map(texts, removeWords, stopwords("english"))
+```
+
+The package "SnowballC" provides tools to remove words suffixes, convert words sharing a common root, to the stem. Stemming might be a useful process to reduce the memory use, and increase coverage. However, the stemming process is difficult to harness, and the process potentially will cause some unexpected results.
+Usage example: texts <- tm_map(texts, stemDocument)
+
+###Step3: Prevent profanity
+After searching and comparing some lists of profanity words, [one list](https://gist.github.com/ryanlewis/a37739d710ccdb4b406d) is chosen for profanity filtering.
+
+```{r profanity}
+bad_word_list <- readLines("bad_words.list", encoding="UTF-8", skipNul=TRUE)
+texts <- tm_map(texts, removeWords, bad_word_list)
+
+## clean up the spaces may be introduced during the preprocessing, and make sure it is plain text format, not a vector.
+texts <- tm_map(texts, stripWhitespace)  
+texts <- tm_map(texts, PlainTextDocument)
+```
+
+##5. Prepare N-grams {.tabset .tabset-fade .tabset-pills}
+
+###Step1: Tokenization
+Prepare the functions which can organize the corpus into units with certain number of words.
+
+```{r token}
+Bigram_Tokenizer <- function(x) {RWeka::NGramTokenizer(x, RWeka::Weka_control(min=2, max=2))}
+Trigram_Tokenizer <- function(x) {RWeka::NGramTokenizer(x, RWeka::Weka_control(min=3, max=3))}
+```
+
+###Step2: Document term matrix
+"Document-Term Matix" is the matix storing the occurances of a word or set of words (Term) in each dataset of the corpus (Document).
+Each "Term" take one column, and each "Document" take one row. 
+
+```{r matrix}
+dtm_mono <- DocumentTermMatrix(texts)
+dtm_bi <- DocumentTermMatrix(texts, control=list(tokenize=Bigram_Tokenizer))
+dtm_tri <- DocumentTermMatrix(texts, control=list(tokenize=Trigram_Tokenizer))
+```
+
+###Step3 Sparse terms:
+We have three sources of text: "Tweets", "News", and "Blogs". Let's retain only the terms which appear at least in two sources, by specifying the sparsity threshold to 0.5. If the term only appear in one source, the sparsity of the word will be 2/3, which is higher than 0.5, and will be removed.
+```{r sparse}
+dtm_mono <- removeSparseTerms(dtm_mono, 0.5)
+dtm_bi <- removeSparseTerms(dtm_bi, 0.5)
+dtm_tri <- removeSparseTerms(dtm_tri, 0.5)
+```
+
+##6.The Visualization of N-grams {.tabset .tabset-fade .tabset-pills}
+
+```{r plots_function, echo=FALSE}
+plot_hist_cloud <- function(x) {
+    dtm_matrix <- as.matrix(x)
+    cleaner_dtm <- colSums(dtm_matrix)
+    words_data_frame <- data.frame(words=names(cleaner_dtm), counts=as.numeric(cleaner_dtm))
+
+getPalette = colorRampPalette(brewer.pal(6, "Dark2"))
+dark2 <- brewer.pal(6, "Dark2")
+
+p <- ggplot(top_n(words_data_frame,20,wt=counts), aes(x=reorder(words, -counts), y=counts, fill=factor(counts)) )
+p <- p + geom_bar(stat="identity")
+p <- p + scale_fill_manual(values=getPalette(20))
+p <- p + theme(axis.text.x=element_text(angle=45, hjust=1), legend.position="none")
+p <- p + labs(x = "Top Ranking Terms", y = "Counts")
+p <- p + geom_text(aes(label = counts), vjust=1)
+
+wordcloud(words_data_frame$words, words_data_frame$counts, ,c(8,.1), max.words=100, random.order=FALSE, rot.per=0.35, use.r.layout=FALSE, colors=dark2)
+p
+
+}
+```
+
+###6.1 Distribution Histogram and Wordcloud Plot for 1-gram
+```{r plots_mono, cache=FALSE}
+plot_hist_cloud(dtm_mono)
+```
+
+###6.2 Distribution Histogram and Wordcloud plot for 2-gram
+```{r plots_bi, cache=FALSE}
+plot_hist_cloud(dtm_bi)
+```
+
+###6.3 Distribution Histogram and Wordcloud plot for 3-gram
+```{r plots_tri, cache=FALSE}
+plot_hist_cloud(dtm_tri)
+```
+
+###6.4 R code for "plot_hist_cloud" function
+```{r plots_function, eval=FALSE}
+```
+
+##7. Coverage Analysis {.tabset .tabset-fade .tabset-pills}
+
+```{r coverage_function, echo=FALSE}
+calculate_coverage <- function(x, coverage_target) {
+    dtm_matrix <- as.matrix(x)
+    cleaner_dtm <- colSums(dtm_matrix)
+    sorted_dtm <- sort(cleaner_dtm, decreasing=TRUE)
+    words_data_frame <- data.frame(words=names(sorted_dtm), counts=as.numeric(sorted_dtm), accumulated=as.numeric(cumsum(sorted_dtm)))
+    total_counts <- sum(sorted_dtm)
+    threshold <-total_counts*coverage_target
+    top_ratio <- 1- length(which(words_data_frame$accumulated >= threshold))/length(sorted_dtm)
+    return(top_ratio)
+}
+```
+
+###7.1 Coverage summary table
+From Table 2, we can see that even a small portion of terms can have a decent coverage, especially for 1-gram. For example, top 5% 1-gram tokens can cover 50% total counts.
+This fact will give us some hint for reducing the memory usage of the planned shiny app. However the coverage of 3-gram is not so satisfying, then we probably will keep almost all the 3-gram tokens to improve prediction accuracy.
+
+```{r coverage_table, echo=FALSE}
+token_sizes <- c("1-gram", "2-gram", "3-gram")
+
+cover_90 <- c(
+calculate_coverage(dtm_mono, 0.9),
+calculate_coverage(dtm_bi, 0.9),
+calculate_coverage(dtm_tri, 0.9))
+
+cover_50 <- c(
+calculate_coverage(dtm_mono, 0.5),
+calculate_coverage(dtm_bi, 0.5),
+calculate_coverage(dtm_tri, 0.5))
+
+cover_30 <- c(
+calculate_coverage(dtm_mono, 0.3),
+calculate_coverage(dtm_bi, 0.3),
+calculate_coverage(dtm_tri, 0.3))
+
+coverage <- data.frame(
+            row.names = token_sizes, 
+            Cover_90_Percent = cover_90,
+            Cover_50_Percent = cover_50,    
+            Cover_30_Percent = cover_30)
+
+kable(coverage, digits=2, caption="Table 2: Coverage Analysis, Ratio of Total Terms Needed", align="c")
+```
+
+###7.2 R code for generate table 2. 
+```{r coverage_table, eval=FALSE}
+```
+
+###7.3 R code for "calculate_coverage" function
+```{r coverage_function, eval=FALSE}
+```
+
+##8. Plan and Some Thoughts
+
+The main plan will be using Markov model based on n-grams freqences from training data to build a probability prediction model.
+Take a 2-gram model for example, 
+$$P(w_n|w^{n-1}_1)\approx P(w_n|w_{n-1})$$
+$$P(w_n|w_{n-1})= \frac{Count(w_{n-1}w_n)}{Count(w_{n-1})}$$
+Calculate the probabilities being the nth word, given the (n-1)th words, and then rank the candidates based on this probabilities.
+
+Some points need to be addressed:
+
+1. How to detect and deal with some sporadic words from foreign languages? Proabably will use Google’s compact language detector "cldr".
+
+2. Is 3-gram enough, do you need higher N? Such as 4-gram or even 5-gram. Need to do more exploration to decide where up to 3-gram is enough.
+
+3. How to add auto correction function to the app? 
+
+4. What is the method "smoothing" the probabilities of tokens? How to predict the words that never occurred in the training set?
+Probably will use interpolation method instead of simple backoff:
+$$\hat{P}(w_n|w_{n-2}w_{n_1})=\lambda_1P(w_n|w_{n-2}w_{n-1}) + \lambda_2P(w_n|w_{n-1}) + \lambda_3 P(w_n)$$
+
+6. How to evaluate model? Certainly will save some portion of the original corpus as validation sets and test sets to quantitatively evaluate the future probablity model.
+
+## Notes
+You can find the source code at my github:
+
